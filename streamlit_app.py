@@ -799,21 +799,19 @@ if not plot_df.empty:
     )
     st.plotly_chart(fig, use_container_width=True)
 
+st.subheader("策略读法（已写入预警）")
 st.markdown(
-    """
-### 策略读法（已写入预警）
-1. **盘前** = 情报（薄流动性 / 影子定价），默认不作为唯一入场依据。  
-2. **开盘 regime**  
-   - `CONTINUATION`：盘前方向被开盘 15m 确认  
-   - `FADE`：盘前方向被正式流动性打回（你说的回原点）  
-   - `CHOP`：等待  
-3. **周状态**  
-   - `DISTRIBUTE` + `FADE` → 收割窗口，慎追盘前拉升  
-   - `UP_LEG` + `CONTINUATION` → 趋势跟随条件更好  
-   - `ACCUMULATE` + 超跌跟随 → 修复行情观察  
-4. **权重撕裂 + 盘前单边** → 指数信号可能掺假，看贡献表谁在拖。
+    "1. **盘前** = 情报（薄流动性/影子定价），默认不作为唯一入场依据。\n\n"
+    "2. **开盘 regime**：`CONTINUATION` 确认盘前方向；`FADE` 为正式流动性打回；`CHOP` 等待。\n\n"
+    "3. **周状态**：`DISTRIBUTE` + `FADE` → 偏收割、慎追盘前；"
+    "`UP_LEG` + `CONTINUATION` → 趋势跟随更好；"
+    "`ACCUMULATE` + 超跌跟随 → 观察修复。\n\n"
+    "4. **权重撕裂 + 盘前单边** → 指数信号可能掺假，看贡献表。\n\n"
+    "运行：`pip install -r requirements.txt` 然后 `streamlit run streamlit_app.py`"
+)
 
-### 运行
-```bash
-pip install -r requirements.txt
-streamlit run streamlit_app.py
+if auto:
+    remain = max(0, REFRESH_SECONDS - int(time.time() - st.session_state.ndx_last_ts))
+    st.caption(f"距自动刷新约 {remain // 60} 分 {remain % 60} 秒（保持页面打开）")
+    time.sleep(min(30, max(1, remain)))
+    st.rerun()
