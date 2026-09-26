@@ -926,9 +926,18 @@ with st.spinner("拉取与计算中…"):
         series = close[t].dropna()
 if series.empty:
     continue
-last = float(series.iloc[-1])
-        rser = rets[t].dropna() if t in rets.columns else pd.Series(dtype=float)
-chg1 = float(rser.iloc[-1]) * 100 if len(rser) else None
+        if t not in close.columns:
+            continue
+        series = close[t].dropna()
+        if series.empty:
+            continue
+        last = float(series.iloc[-1])
+
+        if t in rets.columns:
+            rser = rets[t].dropna()
+            chg1 = float(rser.iloc[-1]) * 100 if len(rser) else None
+        else:
+            chg1 = None
 
 
         sess = {
