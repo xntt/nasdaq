@@ -917,20 +917,18 @@ with st.spinner("拉取与计算中…"):
     rows = []
     for i, t in enumerate(ordered):
         if t not in close.columns or t not in rets.columns:
+        continue
+
+        series = close[t].dropna()
+        if series.empty:
             continue
+
         fm = follow_metrics(rets[t], bench_r)
         alt = alternation_score(close[t])
         tops = local_top_gaps(close[t])
         tag = tag_follow_reason(close, t, BENCHMARK, rets, window=follow_window)
         wp = week_phase_label(close[t], rets[t])
-        series = close[t].dropna()
-if series.empty:
-    continue
-        if t not in close.columns:
-            continue
-        series = close[t].dropna()
-        if series.empty:
-            continue
+
         last = float(series.iloc[-1])
 
         if t in rets.columns:
