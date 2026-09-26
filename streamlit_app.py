@@ -927,8 +927,7 @@ with st.spinner("拉取与计算中…"):
 if series.empty:
     continue
 last = float(series.iloc[-1])
-        rser = rets[t].dropna() if t in rets.columns else pd.Series(dtype=float)
-chg1 = float(rser.iloc[-1]) * 100 if len(rser) else None
+        chg1 = float(rets[t].dropna().iloc[-1]) * 100 if rets[t].notna().any() else None
 for t in ordered:  # 或你的 for t in close.columns
     if t not in close.columns:
         continue
