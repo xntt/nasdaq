@@ -537,7 +537,318 @@ def fmt(x, pct=False, signed=False):
         return f"{x:.2f}"
     return str(x)
 
+# =========================
+# 模块：周期扫描 + 强者修复 + 规律被大盘打断 + 深跌基本面提示
+# =========================
 
+def find_swing_points(close: pd.Series, left: int = 7, right: int = 7):
+    """局部顶/底：左右各 left/right 根内的极值"""
+    s = close.dropna()
+    if len(s) < left + right + 5:
+        return [], []
+    arr = s.values
+    idx = s.index
+    tops, bots = [], []
+    for i in range(left, len(arr) - right):
+        window = arr[i - left : i + right + 1]
+        if arr[i] >= np.max(window) and arr[i] == window.max():
+            tops.append((idx[i], float(arr[i])))
+        if arr[i] <= np.min(window) and arr[i] == window.min():
+            bots.append((idx[i], float(arr[i])))
+    return tops, bots
+
+
+def _gap_stats(points):
+    """points: list[(ts, price)] -> 间隔天数统计"""
+    if len(points) < 3:
+        return None
+    days = []
+    for (a, _), (b, _) in zip(points[:-1], points[1:]):
+        try:
+            d = (pd.Timestamp(b) - pd.Timestamp(a)).days
+            if d > 0:
+                days.append(d)
+        except Exception:
+            continue
+    if len(days) < 2:
+        return None
+    arr = np.array(days, dtype=float)
+    mean = float(arr.mean())
+    std = float(arr.std(ddof=0))
+    med = float(np.median(arr))
+    cv = std / mean if mean > 0 else None
+    return {"mean": mean, "median": med, "std": std, "cv": cv, "gaps": days[-6:], "n": len(days)}
+
+
+def cycle_score_from_stats(stt) -> float:
+    if not stt or stt["cv"] is None:
+        return 0.0
+    # CV 越小分越高；样本越多略加分
+    cv = stt["cv"]
+    base = max(0.0, 1.0 - min(cv, 1.0))
+    n_bonus = min(0.2, 0.03 * stt["n"])
+    return round(100 * (0.8 * base + n_bonus), 1)
+
+
+def label_cycle_bucket(median_days: Optional[float]) -> str:
+    if median_days is None:
+        return "—"
+    m = median_days
+    if 22 <= m <= 40:
+        return "约月度"
+    if 50 <= m <= 80:
+        return "约季度"
+    if 100 <= m <= 140:
+        return "约4个月"
+    if 10 <= m <= 20:
+        return "约双周"
+    return f"约{m:.0f}日"
+
+
+def scan_ticker_cycle(close: pd.Series, left: int = 7, right: int = 7) -> Dict[str, Any]:
+    tops, bots = find_swing_points(close, left=left, right=right)
+    top_st = _gap_stats(tops)
+    bot_st = _gap_stats(bots)
+    score_t = cycle_score_from_stats(top_st) if top_st else 0.0
+    score_b = cycle_score_from_stats(bot_st) if bot_st else 0.0
+    score = max(score_t, score_b)
+
+    last_top = str(pd.Timestamp(tops[-1][0]).date()) if tops else None
+    last_bot = str(pd.Timestamp(bots[-1][0]).date()) if bots else None
+
+    next_top_win = next_bot_win = None
+    if top_st and tops:
+        last = pd.Timestamp(tops[-1][0])
+        med = top_st["median"]
+        next_top_win = f"{(last + pd.Timedelta(days=med - 5)).date()} ~ {(last + pd.Timedelta(days=med + 5)).date()}"
+    if bot_st and bots:
+        last = pd.Timestamp(bots[-1][0])
+        med = bot_st["median"]
+        next_bot_win = f"{(last + pd.Timedelta(days=med - 5)).date()} ~ {(last + pd.Timedelta(days=med + 5)).date()}"
+
+    return {
+        "规律分": score,
+        "底间隔中位": bot_st["median"] if bot_st else None,
+        "顶间隔中位": top_st["median"] if top_st else None,
+        "底CV": bot_st["cv"] if bot_st else None,
+        "顶CV": top_st["cv"] if top_st else None,
+        "周期标签": label_cycle_bucket(bot_st["median"] if bot_st else (top_st["median"] if top_st else None)),
+        "最近底": last_bot,
+        "最近顶": last_top,
+        "下一次底窗口": next_bot_win,
+        "下一次顶窗口": next_top_win,
+        "底样本数": bot_st["n"] if bot_st else 0,
+        "顶样本数": top_st["n"] if top_st else 0,
+    }
+
+
+def index_disrupts_cycle(
+    stock_close: pd.Series,
+    bench_close: pd.Series,
+    cycle_info: Dict[str, Any],
+    lookback: int = 15,
+) -> Dict[str, Any]:
+    """
+    大盘曲线打乱个股原规律：
+    - 个股处于「预测底/顶窗口」附近，但指数出现急跌/急涨主导
+    - 或个股与指数近窗相关骤升且同向大波动（节奏被大盘拽走）
+    """
+    out = {"打乱": 0, "说明": "—"}
+    if stock_close is None or bench_close is None:
+        return out
+    s = stock_close.dropna().tail(lookback + 5)
+    b = bench_close.dropna().reindex(s.index).dropna()
+    s = s.reindex(b.index)
+    if len(s) < 8:
+        return out
+
+    s_ret = s.pct_change().dropna()
+    b_ret = b.pct_change().reindex(s_ret.index).dropna()
+    s_ret = s_ret.reindex(b_ret.index)
+    corr = float(s_ret.tail(10).corr(b_ret.tail(10))) if len(s_ret) >= 10 else None
+    b_move = float(b.iloc[-1] / b.iloc[-min(5, len(b))] - 1) * 100
+    s_move = float(s.iloc[-1] / s.iloc[-min(5, len(s))] - 1) * 100
+
+    in_bot_window = False
+    in_top_window = False
+    today = pd.Timestamp(s.index[-1]).normalize()
+    for key, flag_name in [("下一次底窗口", "bot"), ("下一次顶窗口", "top")]:
+        win = cycle_info.get(key)
+        if not win or " ~ " not in str(win):
+            continue
+        try:
+            a, c = str(win).split(" ~ ")
+            a, c = pd.Timestamp(a.strip()), pd.Timestamp(c.strip())
+            if a <= today <= c:
+                if flag_name == "bot":
+                    in_bot_window = True
+                else:
+                    in_top_window = True
+        except Exception:
+            pass
+
+    reasons = []
+    # 窗口内但走势被指数大波绑架
+    if in_bot_window and b_move < -2.5 and s_move < -1.0:
+        reasons.append("处于预期底窗口，但大盘急跌拖累，周期信号可能失效")
+    if in_top_window and b_move > 2.5 and s_move > 1.0:
+        reasons.append("处于预期顶窗口，但大盘急涨抬轿，见顶节奏可能延后")
+    if corr is not None and corr > 0.85 and abs(b_move) > 3:
+        reasons.append(f"近窗与大盘高度同向(corr={corr:.2f})，个股独立周期被指数主导")
+    # 规律分尚可，但近5日个股波动几乎全是指数同向
+    if cycle_info.get("规律分", 0) >= 55 and corr is not None and corr > 0.8 and abs(b_move) > 2:
+        reasons.append("历史有规律，当前波段更像大盘驱动")
+
+    if reasons:
+        out["打乱"] = 1
+        out["说明"] = "；".join(reasons)
+    return out
+
+
+def detect_qqq_pullback_events(bench_close: pd.Series, thresh: float = -0.02, max_events: int = 6) -> List[Dict[str, Any]]:
+    """从近端找出 QQQ 短回撤事件：自滚动高点回撤超过 thresh"""
+    s = bench_close.dropna().tail(120)
+    if len(s) < 30:
+        return []
+    events = []
+    i = 10
+    while i < len(s) - 3:
+        window = s.iloc[: i + 1]
+        peak = window.max()
+        peak_idx = window.idxmax()
+        cur = s.iloc[i]
+        dd = cur / peak - 1
+        if dd <= thresh:
+            # 事件低点：向后再找最多 8 日的更低
+            j_end = min(len(s) - 1, i + 8)
+            seg = s.iloc[i : j_end + 1]
+            low_idx = seg.idxmin()
+            low_px = float(seg.min())
+            events.append({
+                "peak_date": peak_idx,
+                "low_date": low_idx,
+                "peak_px": float(peak),
+                "low_px": low_px,
+                "dd": float(low_px / peak - 1),
+            })
+            i = list(s.index).index(low_idx) + 3
+        else:
+            i += 1
+    return events[-max_events:]
+
+
+def leader_bounce_metrics(
+    stock_close: pd.Series,
+    bench_close: pd.Series,
+    event: Dict[str, Any],
+) -> Dict[str, Any]:
+    """单次回撤事件上的承压与修复"""
+    empty = {"承压比": None, "修复天数": None, "修复比": None, "标签": "—"}
+    try:
+        peak_d, low_d = event["peak_date"], event["low_date"]
+        sc = stock_close.dropna()
+        bc = bench_close.dropna()
+        # 对齐
+        if peak_d not in sc.index or low_d not in sc.index:
+            # 用最近索引
+            sc2 = sc.loc[(sc.index >= peak_d) & (sc.index <= low_d)]
+            if sc2.empty:
+                return empty
+            s_peak = float(sc.loc[:peak_d].iloc[-1])
+            s_low = float(sc2.min())
+            s_low_date = sc2.idxmin()
+        else:
+            s_peak = float(sc.loc[peak_d])
+            seg = sc.loc[peak_d:low_d]
+            s_low = float(seg.min())
+            s_low_date = seg.idxmin()
+
+        b_dd = event["dd"]
+        s_dd = s_low / s_peak - 1 if s_peak else None
+        pressure = (s_dd / b_dd) if (s_dd is not None and b_dd and b_dd != 0) else None
+
+        # 修复：从 s_low_date 起回到 s_peak 的天数
+        after = sc.loc[s_low_date:]
+        recover_days = None
+        for k, (dt, px) in enumerate(after.items()):
+            if float(px) >= s_peak * 0.995:
+                recover_days = k
+                break
+        # 同学段指数反弹
+        b_after = bc.loc[event["low_date"]:]
+        b_low = event["low_px"]
+        # 个股从低点反弹到目前或到恢复点
+        if recover_days is not None and recover_days < len(after):
+            s_rebound = float(after.iloc[recover_days]) / s_low - 1 if s_low else None
+            b_px = float(b_after.iloc[min(recover_days, len(b_after) - 1)]) if len(b_after) else None
+            b_rebound = (b_px / b_low - 1) if (b_px and b_low) else None
+        else:
+            s_rebound = float(after.iloc[-1]) / s_low - 1 if len(after) and s_low else None
+            b_rebound = float(b_after.iloc[-1]) / b_low - 1 if len(b_after) and b_low else None
+            recover_days = None if recover_days is None else recover_days
+
+        repair_ratio = None
+        if s_rebound is not None and b_rebound and abs(b_rebound) > 1e-6:
+            repair_ratio = s_rebound / b_rebound
+
+        tag = "—"
+        if pressure is not None and repair_ratio is not None:
+            if pressure <= 1.05 and repair_ratio >= 1.1 and (recover_days is not None and recover_days <= 8):
+                tag = "LEADER_BOUNCE"
+            elif pressure >= 1.25 or (recover_days is not None and recover_days > 12):
+                tag = "LAGGARD"
+            elif pressure <= 0.75:
+                tag = "抗跌"
+            else:
+                tag = "中性"
+        elif pressure is not None and pressure >= 1.3:
+            tag = "LAGGARD"
+
+        return {
+            "承压比": pressure,
+            "修复天数": recover_days,
+            "修复比": repair_ratio,
+            "标签": tag,
+            "个股回撤%": s_dd * 100 if s_dd is not None else None,
+            "指数回撤%": b_dd * 100 if b_dd is not None else None,
+        }
+    except Exception:
+        return empty
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_fundamentals_quick(ticker: str) -> Dict[str, Any]:
+    """深跌后快速基本面查询（yfinance，字段可能缺失）"""
+    info = {}
+    try:
+        t = yf.Ticker(ticker)
+        inf = t.info or {}
+        info = {
+            "名称": inf.get("shortName") or inf.get("longName"),
+            "行业": inf.get("industry"),
+            "板块": inf.get("sector"),
+            "市盈率TTM": inf.get("trailingPE"),
+            "预期市盈率": inf.get("forwardPE"),
+            "市净率": inf.get("priceToBook"),
+            "利润率": inf.get("profitMargins"),
+            "营收增长": inf.get("revenueGrowth"),
+            "盈利增长": inf.get("earningsGrowth"),
+            "负债权益": inf.get("debtToEquity"),
+            "分析师目标价": inf.get("targetMeanPrice"),
+            "建议": inf.get("recommendationKey"),
+        }
+    except Exception as e:
+        info = {"错误": str(e)}
+    return info
+
+
+def deep_drawdown_flags(close: pd.Series, thresh: float = -0.15) -> Dict[str, Any]:
+    """近 60 日相对高点回撤"""
+    s = close.dropna().tail(60)
+    if len(s) < 20:
+        return {"深跌": 0, "回撤%": None}
+    dd = float(s.iloc[-1] / s.max() - 1)
+    return {"深跌": 1 if dd <= thresh else 0, "回撤%": dd * 100}
 # =========================
 # UI
 # =========================
@@ -809,7 +1120,105 @@ st.markdown(
     "4. **权重撕裂 + 盘前单边** → 指数信号可能掺假，看贡献表。\n\n"
     "运行：`pip install -r requirements.txt` 然后 `streamlit run streamlit_app.py`"
 )
+# =========================
+# 展示：周期扫描 / 强者修复 / 大盘打乱规律 / 深跌基本面
+# =========================
 
+st.divider()
+st.subheader("📡 规律周期扫描（网红票/观察池）")
+
+cycle_rows = []
+disrupt_alerts = []
+deep_list = []
+
+for t in close.columns:
+    if t == BENCHMARK:
+        continue
+    try:
+        cyc = scan_ticker_cycle(close[t], left=7, right=7)
+        dis = index_disrupts_cycle(close[t], close[BENCHMARK], cyc)
+        dd = deep_drawdown_flags(close[t], thresh=-0.15)
+        row = {"代码": t, **cyc, "规律被大盘打乱": dis["打乱"], "打乱说明": dis["说明"]}
+        cycle_rows.append(row)
+        if dis["打乱"] == 1:
+            disrupt_alerts.append(f"⚠ {t} 规律可能被大盘打乱：{dis['说明']}")
+        if dd["深跌"] == 1:
+            deep_list.append((t, dd["回撤%"]))
+    except Exception:
+        continue
+
+cycle_df = pd.DataFrame(cycle_rows)
+if not cycle_df.empty:
+    cycle_df = cycle_df.sort_values("规律分", ascending=False)
+    show_c = cycle_df.copy()
+    for col in ["底间隔中位", "顶间隔中位", "底CV", "顶CV"]:
+        if col in show_c.columns:
+            show_c[col] = show_c[col].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
+    st.dataframe(show_c, use_container_width=True, height=380)
+    st.caption("规律分越高 = 顶/底间隔越整齐。下一次窗口为中位间隔 ±5 日，需人工确认，非自动买卖信号。")
+else:
+    st.write("周期扫描暂无结果")
+
+if disrupt_alerts:
+    st.subheader("🌪 大盘打乱原规律 — 提示")
+    for a in disrupt_alerts[:40]:
+        st.write("· " + a)
+else:
+    st.write("当前未检测到明显的「窗口内被指数绑架」样本。")
+
+st.divider()
+st.subheader("💪 强者恒强（回撤修复 LEADER_BOUNCE）")
+
+events = detect_qqq_pullback_events(close[BENCHMARK], thresh=-0.02, max_events=5)
+if not events:
+    st.write("近端未识别到足够的 QQQ 回撤事件（可降低阈值或加长历史）。")
+    leader_df = pd.DataFrame()
+else:
+    last_ev = events[-1]
+    st.write(
+        f"最近事件：高点 {pd.Timestamp(last_ev['peak_date']).date()} → "
+        f"低点 {pd.Timestamp(last_ev['low_date']).date()}，QQQ回撤 {last_ev['dd']*100:.2f}%"
+    )
+    lb_rows = []
+    for t in close.columns:
+        if t == BENCHMARK:
+            continue
+        m = leader_bounce_metrics(close[t], close[BENCHMARK], last_ev)
+        lb_rows.append({
+            "代码": t,
+            "标签": m["标签"],
+            "承压比": m["承压比"],
+            "个股回撤%": m["个股回撤%"],
+            "指数回撤%": m["指数回撤%"],
+            "修复天数": m["修复天数"],
+            "修复比": m["修复比"],
+        })
+    leader_df = pd.DataFrame(lb_rows)
+    if not leader_df.empty:
+        leader_df = leader_df.sort_values(["标签", "修复比"], ascending=[True, False])
+        show_l = leader_df.copy()
+        for col in ["承压比", "修复比"]:
+            show_l[col] = show_l[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+        for col in ["个股回撤%", "指数回撤%"]:
+            show_l[col] = show_l[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+        st.dataframe(show_l, use_container_width=True, height=360)
+        leaders = leader_df[leader_df["标签"] == "LEADER_BOUNCE"]["代码"].tolist()
+        if leaders:
+            st.success("LEADER_BOUNCE：同一回撤中相对抗跌或修复更快 → " + ", ".join(leaders[:20]))
+
+st.divider()
+st.subheader("🔍 深跌提示 → 查询基本面")
+st.caption("近60日相对高点回撤 ≤ -15% 的标的，建议核对业绩/负债/指引（数据来自 yfinance，仅供参考）。")
+
+if deep_list:
+    deep_list = sorted(deep_list, key=lambda x: x[1])
+    st.write("深跌列表：" + ", ".join([f"{t}({v:.1f}%)" for t, v in deep_list[:30]]))
+    pick = st.selectbox("选择深跌标的查看基本面", [t for t, _ in deep_list])
+    if pick:
+        fund = fetch_fundamentals_quick(pick)
+        st.json(fund)
+else:
+    st.write("当前观察池无触发深跌阈值的标的。")
 if auto:
     remain = max(0, REFRESH_SECONDS - int(time.time() - st.session_state.ndx_last_ts))
     st.caption(f"距自动刷新约 {remain // 60} 分 {remain % 60} 秒（保持页面打开）")
