@@ -917,7 +917,7 @@ with st.spinner("拉取与计算中…"):
     rows = []
     for i, t in enumerate(ordered):
         if t not in close.columns or t not in rets.columns:
-        continue
+            continue
 
         series = close[t].dropna()
         if series.empty:
